@@ -1,0 +1,161 @@
+{
+  "info": {
+    "name": "02 Resilient Delivery",
+    "description": "Workflow 2 test payloads.\n\nRun order: 1, 2, 3, 4a, 4b.\n\nWorkflow must be PUBLISHED. Request 2 takes about 8 seconds because of the backoff, that is the point.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1 - Delivered on first attempt",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"contractor_id\": \"C-30001\",\n  \"name\": \"Aisha Khan\",\n  \"email\": \"aisha.khan@example.com\",\n  \"contract_type\": \"Umbrella\",\n  \"start_date\": \"2026-09-22\",\n  \"agency_name\": \"Northgate Recruitment\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}",
+          "host": [
+            "{{baseUrl}}"
+          ]
+        },
+        "description": "Expect 200, status 'delivered', attempts 1.\n\nThe baseline. Everything after this is a failure mode."
+      },
+      "response": []
+    },
+    {
+      "name": "2 - Retries exhausted -> dead letter + alert",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"contractor_id\": \"C-30002\",\n  \"name\": \"Aisha Khan\",\n  \"email\": \"aisha.khan@example.com\",\n  \"contract_type\": \"Umbrella\",\n  \"start_date\": \"2026-09-22\",\n  \"agency_name\": \"Northgate Recruitment\",\n  \"_demo_force_failure\": true\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}",
+          "host": [
+            "{{baseUrl}}"
+          ]
+        },
+        "description": "The _demo_force_failure flag (gated behind demoMode, ignored in production) points the sender at an unreachable port so every attempt fails instantly.\n\nExpect 502, status 'retries_exhausted', attempts 4 (1 initial + 3 retries).\n\nWATCH IN N8N: the execution log shows Send Email running four times with Wait Before Retry between each, backing off 1s, 2s, 4s. Then a row appears in Dead_Letter, then the alert fires.\n\nThe response reports dead_letter_written and the alert outcome separately."
+      },
+      "response": []
+    },
+    {
+      "name": "3 - Validation failure -> dead letter, NO alert",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"contractor_id\": \"C-30003\",\n  \"name\": \"Sam Patel\",\n  \"email\": \"not-an-email\",\n  \"agency_name\": \"Harborview Talent\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}",
+          "host": [
+            "{{baseUrl}}"
+          ]
+        },
+        "description": "Missing contract_type and start_date, invalid email.\n\nExpect 422 with all errors in one array, plus dead_letter_written: true.\n\nThe distinction that matters: this IS persisted, because nothing should be silently lost, but it does NOT page anyone. It is the caller's error to fix and cannot be replayed. Check the sheet: reason is validation_failed and alerted is not_required."
+      },
+      "response": []
+    },
+    {
+      "name": "4a - Malformed JSON, declared as JSON",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"contractor_id\":",
+          "options": {
+            "raw": {
+              "language": "text"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}",
+          "host": [
+            "{{baseUrl}}"
+          ]
+        },
+        "description": "Expect n8n's OWN error: code 422, 'Failed to parse request body'.\n\nThis is correct and worth explaining on camera. n8n's HTTP layer parses the body before any node runs, so no node can catch this. Nothing crashes and nothing is half-processed."
+      },
+      "response": []
+    },
+    {
+      "name": "4b - Malformed JSON, sent as text",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "text/plain"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"contractor_id\":",
+          "options": {
+            "raw": {
+              "language": "text"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}",
+          "host": [
+            "{{baseUrl}}"
+          ]
+        },
+        "description": "Same broken body, but Content-Type is text/plain so n8n does not try to parse it.\n\nNow it reaches the workflow. Expect 400, status 'invalid_json', with a correlation_id, produced by Validate and Normalise.\n\nRun 4a and 4b back to back and say: I handle the case I can own, and I know where the boundary is."
+      },
+      "response": []
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:5678/webhook/delivery",
+      "type": "string"
+    }
+  ]
+}

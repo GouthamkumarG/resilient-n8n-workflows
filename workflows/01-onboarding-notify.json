@@ -1,0 +1,709 @@
+{
+  "name": "01 Onboarding Notify",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "onboarding",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "a5e5b84f-6954-5613-9026-9caf8ed231c1",
+      "name": "Webhook - Onboarding Event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -460,
+        400
+      ],
+      "webhookId": "54a75496-52af-59ff-b4ec-1e033364a47b"
+    },
+    {
+      "parameters": {
+        "jsCode": "// WF1 runtime configuration.\n// NON-SECRET values only. API keys and OAuth tokens live in n8n Credentials, never here.\n// Only sheetId must be changed before first run.\nconst config = {\n  emailUrl: 'https://postman-echo.com/post',   // stub SMTP endpoint (echoes the request so the body is visible in the execution log)\n  smsUrl:   'https://postman-echo.com/post',   // stub for Respond.io / WhatsApp Business API\n  sheetId:  'YOUR_GOOGLE_SHEET_ID',\n  sheetTab: 'Onboarding_Audit',\n  senderEmail: 'onboarding@example.com',\n  senderName:  '<COMPANY> (demo)',\n  dedupeWindowDays: 7,\n  demoMode: true\n};\nreturn $input.all().map(i => ({ json: { ...i.json, config }, binary: i.binary }));",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "8a9a5d93-e397-5f13-b39a-b9abb174bbf8",
+      "name": "Set Runtime Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Single validation gate. Returns a structured result, never throws, so the\n// workflow cannot crash on a bad payload and the caller always gets an answer.\nconst item = $input.first();\nconst config = item.json.config;\nconst correlation_id = 'WF1-' + $execution.id;\nconst received_at = new Date().toISOString();\nconst base = { config, correlation_id, received_at };\n\nfunction fail(httpCode, status, message, extra) {\n  return [{ json: { ...base, valid: false, httpCode, contractor_id: null, outcome: status,\n    response: Object.assign({ status, message, correlation_id }, extra || {}) } }];\n}\n\n// 1. Recover the body in whichever shape the webhook delivered it.\nlet raw = null, parsed = null;\ntry {\n  if (item.binary && item.binary.data && item.binary.data.data) {\n    raw = Buffer.from(item.binary.data.data, 'base64').toString('utf8');\n  } else if (typeof item.json.body === 'string') {\n    raw = item.json.body;\n  }\n  if (raw !== null) {\n    if (raw.length > 16384) return fail(413, 'payload_too_large', 'Request body exceeds the 16 KiB limit for this endpoint.');\n    parsed = JSON.parse(raw);\n  } else {\n    parsed = item.json.body;\n  }\n} catch (err) {\n  return fail(400, 'invalid_json', 'Request body is not valid JSON. Nothing was processed.');\n}\n\nif (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {\n  return fail(422, 'invalid_payload', 'Request body must be a JSON object.');\n}\n\n// 2. Field level validation. Every problem is collected, not just the first one,\n// so the caller can fix the whole payload in one round trip.\nconst REQUIRED = ['contractor_id','name','email','phone','contract_type','start_date','agency_name'];\nconst CONTRACT_TYPES = ['PAYE','Umbrella','Ltd'];\nconst errors = [];\nconst c = {};\n\nfor (const f of REQUIRED) {\n  let v = parsed[f];\n  if (typeof v === 'number' && Number.isSafeInteger(v)) v = String(v);\n  if (typeof v !== 'string' || v.trim() === '') { errors.push({ field: f, code: 'MISSING_OR_EMPTY' }); continue; }\n  v = v.trim();\n  if (v.length > 256) { errors.push({ field: f, code: 'TOO_LONG', max: 256 }); continue; }\n  c[f] = v;\n}\n\n// Explicit boolean check. \"false\" as a string is truthy in JS and is a real\n// integration bug, so it is rejected rather than silently treated as verified.\nif (typeof parsed.documents_verified !== 'boolean') {\n  errors.push({ field: 'documents_verified', code: 'MUST_BE_BOOLEAN', received: typeof parsed.documents_verified });\n} else {\n  c.documents_verified = parsed.documents_verified;\n}\n\nif (c.email && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(c.email)) {\n  errors.push({ field: 'email', code: 'INVALID_FORMAT' });\n}\n\nif (c.phone) {\n  const digits = c.phone.replace(/[\\s()\\-]/g, '');\n  if (!/^\\+?[0-9]{7,15}$/.test(digits)) errors.push({ field: 'phone', code: 'INVALID_FORMAT' });\n  else c.phone = digits;\n}\n\nif (c.contract_type && !CONTRACT_TYPES.includes(c.contract_type)) {\n  errors.push({ field: 'contract_type', code: 'INVALID_VALUE', allowed: CONTRACT_TYPES });\n}\n\nif (c.start_date) {\n  const d = new Date(c.start_date + 'T00:00:00Z');\n  const wellFormed = /^\\d{4}-\\d{2}-\\d{2}$/.test(c.start_date);\n  if (!wellFormed || !Number.isFinite(d.getTime()) || d.toISOString().slice(0,10) !== c.start_date) {\n    errors.push({ field: 'start_date', code: 'EXPECTED_YYYY_MM_DD' });\n  }\n}\n\nif (errors.length) {\n  return [{ json: { ...base, valid: false, httpCode: 422,\n    contractor_id: c.contractor_id || null, outcome: 'validation_failed', payload: c,\n    response: { status: 'validation_failed',\n      message: errors.length + ' field(s) failed validation. No notification was sent.',\n      correlation_id, errors } } }];\n}\n\n// 3. Derive the routing decision and the idempotency key once, here, so every\n// downstream node agrees on them.\nconst event_kind = c.documents_verified ? 'welcome' : 'documents_outstanding';\nconst idempotency_key = [c.contractor_id, c.agency_name.toLowerCase(), c.start_date, event_kind].join('|');\n\nreturn [{ json: { ...base, valid: true, payload: c, contractor_id: c.contractor_id, event_kind, idempotency_key } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "eff1f90a-bede-5859-8e49-b35df2d5dda6",
+      "name": "Validate and Normalise",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "f309dc91-9f6c-536f-8170-d709c4e0b352",
+              "leftValue": "={{ $json.valid === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e3f3723e-4c12-5dfb-a107-ca0f325d70f9",
+      "name": "Payload Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        200,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Idempotency claim.\n// At ~20k onboarding events a week a webhook retry storm would otherwise message\n// thousands of contractors twice. Workflow static data gives us deduplication with\n// zero external dependencies, which keeps this workflow importable and runnable as is.\n//\n// HONEST LIMIT: static data is written when the execution finishes, so this\n// deduplicates sequential retries (the common case) but is NOT a distributed lock.\n// In production against SQL Server this becomes a single atomic claim statement\n// (MERGE with HOLDLOCK, or INSERT into a unique index and catch the violation).\nconst e = $input.first().json;\nconst store = $getWorkflowStaticData('global');\nstore.events = store.events || {};\n\nconst windowMs = (e.config.dedupeWindowDays || 7) * 86400000;\nconst now = Date.now();\nfor (const k of Object.keys(store.events)) {\n  if (now - (store.events[k].claimed_at || 0) > windowMs) delete store.events[k];\n}\n\nconst prior = store.events[e.idempotency_key];\nif (prior) {\n  return [{ json: { ...e, is_new: false, httpCode: 200, outcome: 'duplicate_suppressed',\n    response: { status: 'duplicate_suppressed',\n      message: 'This onboarding event was already processed. No duplicate notification was sent.',\n      correlation_id: e.correlation_id, contractor_id: e.contractor_id,\n      original_correlation_id: prior.correlation_id, original_outcome: prior.outcome } } }];\n}\n\nstore.events[e.idempotency_key] = { claimed_at: now, correlation_id: e.correlation_id, outcome: 'processing' };\nreturn [{ json: { ...e, is_new: true } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "2f34e62d-85eb-582a-941b-9678bb01b8ab",
+      "name": "Claim Idempotency Key",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "1dd453fc-c493-5166-ada5-abd54edf2453",
+              "leftValue": "={{ $json.is_new === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "27521b3b-953d-573d-82a2-0d0b4d533e8e",
+      "name": "New Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "19ad1eb6-3f09-5195-9cd3-60cd54c79cf9",
+              "leftValue": "={{ $json.payload.documents_verified === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "afb642b6-b920-5d67-b5ef-975980eceec5",
+      "name": "Documents Verified?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        860,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $input.first().json, p = e.payload;\nconst tag = e.config.demoMode ? '[DEMO] ' : '';\n\nconst subject = tag + 'Welcome, your ' + p.contract_type + ' engagement starts ' + p.start_date;\nconst body = [\n  'Hello ' + p.name + ',',\n  '',\n  'Your onboarding documents have been verified and your engagement is confirmed.',\n  '',\n  'Contract type: ' + p.contract_type,\n  'Start date:    ' + p.start_date,\n  'Agency:        ' + p.agency_name,\n  '',\n  'If any of the above is wrong, contact your agency before your start date.',\n  '',\n  'Reference: ' + e.correlation_id\n].join('\\n');\n\nconst sms = tag + 'Hi ' + p.name + ', your documents are verified. Your ' + p.contract_type +\n  ' engagement starts ' + p.start_date + '. Check your email for the details.';\n\nreturn [{ json: { ...e, template: 'welcome', channels: {},\n  emailBody: {\n    personalizations: [{ to: [{ email: p.email, name: p.name }] }],\n    from: { email: e.config.senderEmail, name: e.config.senderName },\n    subject,\n    content: [{ type: 'text/plain', value: body }]\n  },\n  smsBody: { to: p.phone, body: sms } } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "c6643c51-739a-55bb-9896-aa4d43b9f9a4",
+      "name": "Build Welcome Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $input.first().json, p = e.payload;\nconst tag = e.config.demoMode ? '[DEMO] ' : '';\n\nconst subject = tag + 'Action needed, documents outstanding for your ' + p.start_date + ' start';\nconst body = [\n  'Hello ' + p.name + ',',\n  '',\n  'We cannot complete your onboarding yet because your documents are still outstanding.',\n  '',\n  'Contract type: ' + p.contract_type,\n  'Start date:    ' + p.start_date,\n  'Agency:        ' + p.agency_name,\n  '',\n  'Please contact ' + p.agency_name + ' using your existing trusted contact details to',\n  'complete your documents. Your start date is at risk until this is done.',\n  '',\n  'Reference: ' + e.correlation_id\n].join('\\n');\n\nconst sms = tag + 'Hi ' + p.name + ', documents are still outstanding for your ' + p.start_date +\n  ' start. Please check your email and contact ' + p.agency_name + '.';\n\nreturn [{ json: { ...e, template: 'documents_outstanding', channels: {},\n  emailBody: {\n    personalizations: [{ to: [{ email: p.email, name: p.name }] }],\n    from: { email: e.config.senderEmail, name: e.config.senderName },\n    subject,\n    content: [{ type: 'text/plain', value: body }]\n  },\n  smsBody: { to: p.phone, body: sms } } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "67279fe0-660f-5bfd-82ea-bffa8848f3c2",
+      "name": "Build Documents Outstanding Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        340
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "19434733-d900-50cb-a35a-0e153b65c7d5",
+      "name": "Notification Ready",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.emailUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.emailBody) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Correlation-ID",
+              "value": "={{ $json.correlation_id }}"
+            },
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.idempotency_key }}:email"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "bd47cc21-d5c3-5286-b435-5f1a21ffc21b",
+      "name": "Send Email (stub endpoint)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        220
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Classify the email attempt. Reached on BOTH the success and the error output of\n// the HTTP node, so a transport failure is recorded rather than lost.\nconst e = $('Notification Ready').first().json;\nconst r = $input.first().json;\n\nconst status = Number(r.statusCode || 0);\nconst transportError = Boolean(r.error) || !status;\nconst accepted = !transportError && status >= 200 && status < 300;\n\n// 2xx means ACCEPTED BY THE PROVIDER, not delivered to the human. 5xx and transport\n// failures are 'uncertain' because the message may or may not have gone out.\nconst state = accepted ? 'accepted' : (transportError || status >= 500 ? 'uncertain' : 'rejected');\n\nreturn [{ json: { ...e, channels: { ...e.channels, email: {\n  state,\n  http_status: status || null,\n  reason: accepted ? null : (transportError ? 'TRANSPORT_ERROR' : 'HTTP_' + status),\n  attempted_at: new Date().toISOString()\n} } } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "ead81520-b9b5-5620-8e4e-9f3598e42061",
+      "name": "Capture Email Outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.smsUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.smsBody) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Correlation-ID",
+              "value": "={{ $json.correlation_id }}"
+            },
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.idempotency_key }}:sms"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "20cd1070-0bf9-5ebc-816c-cd2e098a660d",
+      "name": "Send SMS (stub endpoint)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        220
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $('Capture Email Outcome').first().json;\nconst r = $input.first().json;\n\nconst status = Number(r.statusCode || 0);\nconst transportError = Boolean(r.error) || !status;\nconst accepted = !transportError && status >= 200 && status < 300;\nconst state = accepted ? 'accepted' : (transportError || status >= 500 ? 'uncertain' : 'rejected');\n\nreturn [{ json: { ...e, channels: { ...e.channels, sms: {\n  state,\n  http_status: status || null,\n  reason: accepted ? null : (transportError ? 'TRANSPORT_ERROR' : 'HTTP_' + status),\n  attempted_at: new Date().toISOString()\n} } } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "69814928-7b2a-5328-9408-7ffb53d57c8c",
+      "name": "Capture SMS Outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Single place that decides the outcome, so the audit row and the HTTP response\n// can never disagree with each other.\nconst e = $input.first().json;\nconst em = e.channels.email || { state: 'not_attempted' };\nconst sm = e.channels.sms   || { state: 'not_attempted' };\n\nconst both    = em.state === 'accepted' && sm.state === 'accepted';\nconst reached = em.state === 'accepted' || sm.state === 'accepted';\n\nconst outcome  = both ? e.event_kind + '_sent'\n               : reached ? e.event_kind + '_sent_degraded'\n               : 'delivery_failed';\nconst httpCode = both ? 200 : (reached ? 207 : 502);\n\nconst message = both\n  ? 'Both channels accepted the notification.'\n  : reached\n    ? 'The contractor was reached on one channel. The other failed and is recorded below for review.'\n    : 'No channel accepted the notification. Nothing was delivered and this event is safe to resubmit.';\n\n// Close out the idempotency claim. If NOTHING was delivered we release the claim so\n// a retry is not blocked by a send that never happened.\nconst store = $getWorkflowStaticData('global');\nif (store.events && store.events[e.idempotency_key]) {\n  if (reached) store.events[e.idempotency_key].outcome = outcome;\n  else delete store.events[e.idempotency_key];\n}\n\nreturn [{ json: { ...e, outcome, httpCode, response: {\n  status: outcome, message,\n  correlation_id: e.correlation_id,\n  contractor_id: e.contractor_id,\n  event_kind: e.event_kind,\n  channels: e.channels,\n  demo_mode: e.config.demoMode\n} } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "be90cf31-062a-5294-9034-0427cd530f59",
+      "name": "Decide Delivery Outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2420,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// One audit row per event, on EVERY path: validation failure, duplicate, and delivery.\n// Emits EXACTLY the ten sheet columns and nothing else. n8n's auto-mapping APPENDS a new\n// column for any field it cannot match against a header, so carrying context through here\n// would silently widen the audit sheet.\nconst e  = $input.first().json;\nconst p  = e.payload  || {};\nconst ch = e.channels || {};\n\nreturn [{ json: {\n  contractor_id:  e.contractor_id || p.contractor_id || '',\n  timestamp:      new Date().toISOString(),\n  outcome:        e.outcome || 'unknown',\n  correlation_id: e.correlation_id || '',\n  event_kind:     e.event_kind || '',\n  contract_type:  p.contract_type || '',\n  agency_name:    p.agency_name || '',\n  email_state:    (ch.email && ch.email.state) || 'not_attempted',\n  sms_state:      (ch.sms   && ch.sms.state)   || 'not_attempted',\n  demo_mode:      e.config && e.config.demoMode ? 'true' : 'false'\n} }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "b14d1813-49e5-5f27-a145-1b06cc371d73",
+      "name": "Build Audit Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Onboarding_Audit"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "id": "5b99e7d1-ba93-5b56-9836-ffa0e982ec47",
+      "name": "Append Audit Row (Google Sheets)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2860,
+        420
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The outcome was decided on one of three mutually exclusive paths. Read it back from\n// whichever of those nodes actually ran, most specific first.\nfunction upstream() {\n  for (const name of ['Decide Delivery Outcome', 'Claim Idempotency Key', 'Validate and Normalise']) {\n    try {\n      const j = $(name).first().json;\n      if (j && j.httpCode && j.response) return j;\n    } catch (err) { /* this node did not run on this path */ }\n  }\n  return null;\n}\n\nconst ctx = upstream() || { httpCode: 500, response: {\n  status: 'internal_error',\n  message: 'The outcome could not be resolved. Inspect this execution before resubmitting.'\n} };\n\nconst r = $input.first().json;\nconst logged = !r.error;\nconst response = { ...ctx.response, audit_logged: logged };\n\nif (!logged) {\n  // Say WHY the audit failed. An audit gap you cannot diagnose is barely better than no audit.\n  const err = r.error;\n  const detail = typeof err === 'string'\n    ? err\n    : (err && (err.message || err.description || err.reason)) || JSON.stringify(err);\n  response.audit_warning = 'The notification outcome above is accurate, but the audit row could not be written to Google Sheets. Reconcile from the n8n execution log before trusting the sheet.';\n  response.audit_error = String(detail).slice(0, 300);\n}\n\nreturn [{ json: { httpCode: ctx.httpCode, response } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "cffdf629-b5c2-59e6-8152-a8599b5cecf5",
+      "name": "Finalise Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3080,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": "={{ $json.httpCode }}"
+        }
+      },
+      "id": "0382e319-ce09-512e-9498-6771d0d1af90",
+      "name": "Respond to Caller",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        3300,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## WF1 ONBOARDING NOTIFY v1.0\n\n**Setup: one value and one credential.**\n\n1. `Append Audit Row (Google Sheets)` -> select a **Google Service Account** credential.\n   That is the only thing to set. The document ID and tab name are literals on that node.\n2. Share the sheet with the service account email address, as Editor.\n3. The sheet needs a tab named `Onboarding_Audit` with these headers in row 1:\n\n`contractor_id | timestamp | outcome | correlation_id | event_kind | contract_type | agency_name | email_state | sms_state | demo_mode`\n\nA service account is used rather than OAuth2 because this n8n runs on plain HTTP,\nand Google only accepts HTTPS redirect URIs. A service account is also the right\nchoice for an unattended production workflow: it belongs to the system, not to a\nperson whose token dies when they leave.\n\nBoth notification channels point at a public echo endpoint that returns the request\nbody, so the email content is visible in the execution log without any key.\n\n**Test payloads**\n\nHappy path -> `documents_verified: true`\nChase path -> `documents_verified: false`\nValidation -> omit `contract_type`, or send `documents_verified: \"false\"` as a string\nMalformed  -> post `{\"contractor_id\":` with Content-Type application/json\nDuplicate  -> post the happy path payload twice\n\n**IMPORTANT:** n8n only persists workflow static data on PRODUCTION executions.\nActivate the workflow and use the production webhook URL, or the duplicate\nsuppression demo will not work.\n\n**Security note.** The webhook is left unauthenticated so this can be imported and\ntested immediately. In production it would take Header Auth plus an IP allowlist,\nand the stub URLs would be SendGrid and Respond.io behind stored credentials.",
+        "height": 660,
+        "width": 900,
+        "color": 4
+      },
+      "id": "60675ecf-c2a8-5be5-850c-4a6fbc6d9c92",
+      "name": "START HERE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Design decisions\n\n**Validation is one Code node, not an IF chain.** Eight IF nodes report one failure at\na time. This collects every problem into one array so a caller fixes the payload in a\nsingle round trip. It returns instead of throwing, so a bad payload can never crash\nthe run.\n\n**`documents_verified` must be a real boolean.** The string `\"false\"` is truthy in\nJavaScript. Accepting it would route an unverified contractor down the welcome branch.\nThat is the kind of quiet integration bug that only shows up in a complaint.\n\n**Idempotency before send, not after.** The key is contractor + agency + start date +\nevent kind. Static data keeps this dependency free. Its limit is stated in the node\nitself: it is not a distributed lock, and in production it becomes an atomic claim in\nSQL Server. If nothing was delivered the claim is released, so a genuine retry is\nnever blocked by a send that did not happen.\n\n**Multi-channel with real fallback.** Email carries the detail, SMS is the nudge. Both\nare always attempted and scored independently, so if email is rejected the contractor\nis still reached and the response says `207` rather than pretending it was clean.",
+        "height": 660,
+        "width": 900,
+        "color": 5
+      },
+      "id": "90907ccf-6390-5576-9f4b-c1e8695a75ed",
+      "name": "DESIGN DECISIONS",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        500,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Honest scope and what Workflow 2 adds\n\n**2xx means accepted, not delivered.** Every channel outcome is `accepted`,\n`rejected`, `uncertain` or `not_attempted`. 5xx and transport failures are\ndeliberately `uncertain`, because the provider may or may not have sent the message,\nand calling that a success is how a missed notification becomes invisible.\n\n**Every external call has both outputs wired.** Nothing reaches a dead end and no\nfailure is swallowed. The audit row is written on all three paths, including\nvalidation failures, so the sheet is a complete record of what arrived, not just of\nwhat worked.\n\n**Sheets writes use cell format RAW.** A contractor ID beginning with `=` cannot\nbecome a live formula in the audit sheet.\n\n**Where malformed JSON is actually caught.** If a caller declares\n`Content-Type: application/json` and sends invalid JSON, n8n's own HTTP layer rejects\nit before any node runs and returns its own structured JSON error. No node can catch\nthat, and nothing is half-processed. If the body arrives as text, Raw Body hands it to\n`Validate and Normalise`, which catches the parse failure and returns this workflow's\nown 400 `invalid_json`. Both routes are graceful; they are simply owned by different\ncomponents, and it is worth knowing which is which.\n\n**Deliberately NOT in this workflow:** automatic send retries, exhausted-retry\nalerting, and dead lettering. Those are Workflow 2, built as a separate workflow so the\nretry and alerting pattern is reusable rather than welded into onboarding.",
+        "height": 660,
+        "width": 900,
+        "color": 5
+      },
+      "id": "d356971a-c4c4-5e9e-b7f6-2776ede39952",
+      "name": "SCOPE AND HONESTY",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1460,
+        -320
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook - Onboarding Event": {
+      "main": [
+        [
+          {
+            "node": "Set Runtime Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Runtime Config": {
+      "main": [
+        [
+          {
+            "node": "Validate and Normalise",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate and Normalise": {
+      "main": [
+        [
+          {
+            "node": "Payload Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Payload Valid?": {
+      "main": [
+        [
+          {
+            "node": "Claim Idempotency Key",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Audit Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Idempotency Key": {
+      "main": [
+        [
+          {
+            "node": "New Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Event?": {
+      "main": [
+        [
+          {
+            "node": "Documents Verified?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Audit Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Documents Verified?": {
+      "main": [
+        [
+          {
+            "node": "Build Welcome Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Documents Outstanding Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Welcome Notification": {
+      "main": [
+        [
+          {
+            "node": "Notification Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Documents Outstanding Notification": {
+      "main": [
+        [
+          {
+            "node": "Notification Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notification Ready": {
+      "main": [
+        [
+          {
+            "node": "Send Email (stub endpoint)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email (stub endpoint)": {
+      "main": [
+        [
+          {
+            "node": "Capture Email Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Capture Email Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture Email Outcome": {
+      "main": [
+        [
+          {
+            "node": "Send SMS (stub endpoint)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send SMS (stub endpoint)": {
+      "main": [
+        [
+          {
+            "node": "Capture SMS Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Capture SMS Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture SMS Outcome": {
+      "main": [
+        [
+          {
+            "node": "Decide Delivery Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Delivery Outcome": {
+      "main": [
+        [
+          {
+            "node": "Build Audit Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Audit Row": {
+      "main": [
+        [
+          {
+            "node": "Append Audit Row (Google Sheets)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append Audit Row (Google Sheets)": {
+      "main": [
+        [
+          {
+            "node": "Finalise Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalise Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalise Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Caller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/London",
+    "executionTimeout": 120,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  }
+}

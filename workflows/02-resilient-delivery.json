@@ -1,0 +1,734 @@
+{
+  "name": "02 Resilient Delivery",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "delivery",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "fbbaa48f-78f5-5975-81c4-b7aa92771d78",
+      "name": "Webhook - Delivery Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -440,
+        420
+      ],
+      "webhookId": "879ff9ea-a7b4-5b6b-b445-3b588cb9c53e"
+    },
+    {
+      "parameters": {
+        "jsCode": "// WF2 runtime configuration. NON-SECRET values only.\nconst config = {\n  emailUrl:       'https://postman-echo.com/post',      // stub SMTP / SendGrid sandbox\n  failureDemoUrl: 'http://127.0.0.1:9/unreachable',     // refuses instantly, for demonstrating exhausted retries\n  alertUrl:       'https://postman-echo.com/post',      // stub for the ops alert channel (Slack webhook / SendGrid)\n  alertRecipient: 'ops-alerts@example.com',\n  sheetId:        'YOUR_GOOGLE_SHEET_ID',\n  deadLetterTab:  'Dead_Letter',\n  maxAttempts:      4,   // 1 initial attempt plus 3 retries, as the specification specifies\n  baseDelaySeconds: 1,   // exponential: 1s, 2s, 4s\n  maxDelaySeconds:  8,\n  demoMode: true\n};\nreturn $input.all().map(i => ({ json: { ...i.json, config }, binary: i.binary }));",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "9e4924b9-9def-5664-9443-881f8a977ee1",
+      "name": "Set Runtime Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Same defensive gate as Workflow 1. Returns, never throws, so a bad payload cannot\n// crash the run and the caller always gets a structured answer.\nconst item = $input.first();\nconst config = item.json.config;\nconst correlation_id = 'WF2-' + $execution.id;\nconst base = { config, correlation_id, received_at: new Date().toISOString() };\n\nfunction fail(httpCode, status, message, extra) {\n  return [{ json: { ...base, valid: false, httpCode, contractor_id: null,\n    reason: status, last_error: message,\n    response: Object.assign({ status, message, correlation_id }, extra || {}) } }];\n}\n\nlet raw = null, parsed = null;\ntry {\n  if (item.binary && item.binary.data && item.binary.data.data) {\n    raw = Buffer.from(item.binary.data.data, 'base64').toString('utf8');\n  } else if (typeof item.json.body === 'string') {\n    raw = item.json.body;\n  }\n  if (raw !== null) {\n    if (raw.length > 16384) return fail(413, 'payload_too_large', 'Request body exceeds the 16 KiB limit.');\n    parsed = JSON.parse(raw);\n  } else {\n    parsed = item.json.body;\n  }\n} catch (err) {\n  return fail(400, 'invalid_json', 'Request body is not valid JSON. Nothing was processed.');\n}\n\nif (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {\n  return fail(422, 'invalid_payload', 'Request body must be a JSON object.');\n}\n\nconst REQUIRED = ['contractor_id','name','email','contract_type','start_date','agency_name'];\nconst CONTRACT_TYPES = ['PAYE','Umbrella','Ltd'];\nconst errors = [];\nconst c = {};\n\nfor (const f of REQUIRED) {\n  let v = parsed[f];\n  if (typeof v === 'number' && Number.isSafeInteger(v)) v = String(v);\n  if (typeof v !== 'string' || v.trim() === '') { errors.push({ field: f, code: 'MISSING_OR_EMPTY' }); continue; }\n  c[f] = v.trim();\n}\nif (c.email && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(c.email)) errors.push({ field: 'email', code: 'INVALID_FORMAT' });\nif (c.contract_type && !CONTRACT_TYPES.includes(c.contract_type)) {\n  errors.push({ field: 'contract_type', code: 'INVALID_VALUE', allowed: CONTRACT_TYPES });\n}\n\nif (errors.length) {\n  return [{ json: { ...base, valid: false, httpCode: 422,\n    contractor_id: c.contractor_id || null, payload: c,\n    reason: 'validation_failed',\n    last_error: errors.length + ' field(s) failed validation',\n    response: { status: 'validation_failed',\n      message: errors.length + ' field(s) failed validation. No delivery was attempted.',\n      correlation_id, errors } } }];\n}\n\n// Demo affordance, gated behind demoMode so it cannot fire in production: lets the\n// retry / alert / dead-letter path be demonstrated without editing configuration.\nconst forceFailure = Boolean(config.demoMode && parsed._demo_force_failure === true);\n\nreturn [{ json: { ...base, valid: true, payload: c, contractor_id: c.contractor_id, forceFailure } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "44035f13-b2a2-54b3-95f9-c3feca3fccfe",
+      "name": "Validate and Normalise",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "bf0c8c6a-0dc4-5cd1-8743-ec2de87f0a3d",
+              "leftValue": "={{ $json.valid === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b0dcb093-ba4c-5760-b115-70e6e56deebc",
+      "name": "Payload Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        230,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $input.first().json, p = e.payload, cfg = e.config;\nconst tag = cfg.demoMode ? '[DEMO] ' : '';\n\nconst body = [\n  'Hello ' + p.name + ',',\n  '',\n  'Confirming your ' + p.contract_type + ' engagement with ' + p.agency_name +\n    ', starting ' + p.start_date + '.',\n  '',\n  'Reference: ' + e.correlation_id\n].join('\\n');\n\nreturn [{ json: { ...e,\n  // Resolved once, here, so every retry hits the same target.\n  targetUrl: e.forceFailure ? cfg.failureDemoUrl : cfg.emailUrl,\n  emailBody: {\n    personalizations: [{ to: [{ email: p.email, name: p.name }] }],\n    subject: tag + 'Your ' + p.contract_type + ' engagement starts ' + p.start_date,\n    content: [{ type: 'text/plain', value: body }]\n  },\n  retry: { attempt: 0, maxAttempts: cfg.maxAttempts, history: [],\n           baseDelaySeconds: cfg.baseDelaySeconds, maxDelaySeconds: cfg.maxDelaySeconds }\n} }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "79ada11d-7b4d-5f0b-a941-65df09b30134",
+      "name": "Init Retry State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.targetUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.emailBody) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Correlation-ID",
+              "value": "={{ $json.correlation_id }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "4220ff04-77fa-5c07-b07f-0076452eac07",
+      "name": "Send Email (stub endpoint)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        690,
+        300
+      ],
+      "onError": "continueErrorOutput",
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Classifies one attempt and decides whether another is warranted.\n// This node is the retry mechanism. n8n's own retryOnFail setting is deliberately OFF\n// on the HTTP node, because the specification requires the retry to live in workflow logic.\nconst base = $('Init Retry State').first().json;\n\n// On the first pass the Wait node has not run. On later passes it carries the history.\nlet history = [];\ntry { history = $('Wait Before Retry').first().json.retry.history || []; } catch (err) { history = []; }\n\nconst r = $input.first().json;\nconst attempt = history.length + 1;\nconst status = Number(r.statusCode || 0);\nconst transport = Boolean(r.error) || !status;\nconst ok = !transport && status >= 200 && status < 300;\n\nlet errText = null;\nif (!ok) {\n  errText = transport\n    ? String((r.error && (r.error.message || r.error.description)) || r.error || 'transport failure').slice(0, 200)\n    : 'HTTP ' + status;\n}\n\nhistory = [...history, { attempt, at: new Date().toISOString(),\n                         http_status: status || null, error: errText }];\n\n// Retry only what is worth retrying. A 4xx other than 429 is a permanent client error:\n// retrying a rejected recipient three times only delays the alert.\nconst retryable   = !ok && (transport || status >= 500 || status === 429);\nconst attemptsLeft = base.retry.maxAttempts - attempt;\nconst shouldRetry  = retryable && attemptsLeft > 0;\n\n// Exponential backoff with jitter, so a provider recovering from an outage is not hit\n// by every stalled execution at the same instant.\nconst raw    = base.retry.baseDelaySeconds * Math.pow(2, attempt - 1);\nconst capped = Math.min(raw, base.retry.maxDelaySeconds);\nconst delay  = Number((capped + capped * 0.25 * Math.random()).toFixed(1));\n\nconst outcome = ok ? 'delivered'\n              : shouldRetry ? 'retrying'\n              : retryable ? 'retries_exhausted'\n              : 'permanent_failure';\n\nreturn [{ json: { ...base, succeeded: ok, reason: ok ? null : outcome,\n  last_error: errText, last_http_status: status || null,\n  retry: { ...base.retry, attempt, history, shouldRetry, retryable,\n           nextDelaySeconds: delay, outcome } } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "0821110f-96d2-5987-833e-b2007561275c",
+      "name": "Evaluate Attempt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        910,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d6e929f8-0b4f-57b2-b183-e165d4785bff",
+              "leftValue": "={{ $json.succeeded === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "331727ca-dead-59c4-b197-42cd7c60ef4a",
+      "name": "Send Succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1130,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $input.first().json;\nconst attempts = e.retry.history.length;\nreturn [{ json: { httpCode: 200, response: {\n  status: 'delivered',\n  message: attempts === 1\n    ? 'Delivered on the first attempt.'\n    : 'Delivered on attempt ' + attempts + ' of ' + e.retry.maxAttempts + '.',\n  correlation_id: e.correlation_id,\n  contractor_id: e.contractor_id,\n  attempts,\n  attempt_history: e.retry.history\n} } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "efa78790-6411-5652-9d53-306349dd34a1",
+      "name": "Build Success Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "90a39f95-f360-5b58-960e-bf89a66c2df6",
+              "leftValue": "={{ $json.retry.shouldRetry === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7e0626df-c1b5-56ed-9a7d-b730ea98f64b",
+      "name": "Retries Remaining?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1360,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "amount": "={{ $json.retry.nextDelaySeconds }}",
+        "unit": "seconds"
+      },
+      "id": "b882563c-68dd-5a2f-b757-448e3707f923",
+      "name": "Wait Before Retry",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1130,
+        560
+      ],
+      "webhookId": "6d5cbf3d-3b64-577a-b9e1-a1298a9f2f36"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reached from two places: a payload that never passed validation, and a delivery that\n// ran out of attempts (or failed permanently). Both are records that must not be lost.\nconst e = $input.first().json;\nconst cfg = e.config;\nconst hist = (e.retry && e.retry.history) || [];\nconst attempts = hist.length;\n\nconst reason = e.reason || 'unknown_failure';\nconst lastError = e.last_error || 'unknown';\nconst ts = new Date().toISOString();\n\n// Allowlist, not denylist. Only failures <COMPANY> owns should page anyone. A malformed\n// body, an invalid payload or a failed validation are all the CALLER's to fix, cannot be\n// replayed, and are recorded without waking anyone up. Anything that reaches this list\n// means our delivery pipeline failed.\nconst OPERATIONAL_FAILURES = ['retries_exhausted', 'permanent_failure'];\nconst alert_required = OPERATIONAL_FAILURES.includes(reason);\nconst caller_error = !alert_required;\n\nreturn [{ json: {\n  config: cfg,\n  correlation_id: e.correlation_id,\n  contractor_id: e.contractor_id || '',\n  reason, attempts, lastError, ts, alert_required, caller_error,\n  // Caller errors keep the status code the validator chose (400/413/422). Operational\n  // failures are ours, so they are a 502.\n  httpCode: caller_error ? (e.httpCode || 422) : 502,\n  validationResponse: e.response || null,\n  deadLetterRow: {\n    correlation_id:   e.correlation_id,\n    timestamp:        ts,\n    contractor_id:    e.contractor_id || '',\n    reason,\n    attempts,\n    last_error:       String(lastError).slice(0, 500),\n    last_http_status: e.last_http_status || '',\n    payload_json:     JSON.stringify(e.payload || {}).slice(0, 5000),\n    alerted:          alert_required ? 'alert_required' : 'not_required'\n  },\n  alertBody: {\n    to: cfg.alertRecipient,\n    subject: '[ALERT] Notification delivery failed for ' + (e.contractor_id || 'unknown contractor'),\n    contractor_id: e.contractor_id || '',\n    correlation_id: e.correlation_id,\n    error_message: String(lastError).slice(0, 500),\n    timestamp: ts,\n    attempts,\n    attempt_history: hist,\n    dead_letter_tab: cfg.deadLetterTab\n  }\n} }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "e10a59bb-958f-5a67-aca8-ea1775b92e15",
+      "name": "Build Failure Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Emits EXACTLY the nine dead-letter columns. n8n appends a new column for any field\n// it cannot match to a header, so nothing else may travel with the item.\nreturn [{ json: $input.first().json.deadLetterRow }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "9db3bf08-cee8-5afb-9667-2edd31301d49",
+      "name": "Build Dead Letter Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Dead_Letter"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "id": "3838e409-3c49-5ac0-b9c7-1e3c4a22024c",
+      "name": "Append Dead Letter (Google Sheets)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2040,
+        620
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reached from both outputs of the Sheets node, so a failed dead-letter write is\n// recorded rather than lost. Context is restored from the last node that had it.\nconst e = $('Build Failure Record').first().json;\nconst r = $input.first().json;\nreturn [{ json: { ...e, dead_letter_written: !r.error,\n  dead_letter_error: r.error\n    ? String((r.error && (r.error.message || r.error.description)) || r.error).slice(0, 300)\n    : null } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "4c724c71-9c4c-5589-a066-34685268ec55",
+      "name": "Capture Dead Letter Write",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2260,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "89756ed3-b252-5afb-81af-b538fb1ebd3e",
+              "leftValue": "={{ $json.alert_required === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "81feb1d3-744b-51b1-87bd-47e461d27501",
+      "name": "Alert Required?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2480,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.alertUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build Failure Record').first().json.alertBody) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Correlation-ID",
+              "value": "={{ $json.correlation_id }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "7d6901b9-4f3f-5811-b8c8-2295c30a2210",
+      "name": "Send Alert (stub endpoint)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2700,
+        520
+      ],
+      "onError": "continueErrorOutput",
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $('Capture Dead Letter Write').first().json;\nconst inp = $input.first().json;\n\n// This node is reached either straight from 'Alert Required?' (no alert needed) or from\n// BOTH outputs of the alert call. When an alert was required, the incoming item IS the\n// alert response, so it is read directly rather than through a node reference.\nlet alert = { attempted: false, delivered: false, error: null };\nif (e.alert_required) {\n  const status = Number(inp.statusCode || 0);\n  const transport = Boolean(inp.error) || !status;\n  const ok = !transport && status >= 200 && status < 300;\n  alert = {\n    attempted: true,\n    delivered: ok,\n    error: ok ? null : (transport\n      ? String((inp.error && (inp.error.message || inp.error.description)) || inp.error || 'transport failure').slice(0, 200)\n      : 'HTTP ' + status)\n  };\n}\n\n// A caller error keeps the body the validator already built and simply gains the\n// persistence facts. It is not reframed as a delivery failure, because it wasn't one.\nif (e.caller_error) {\n  return [{ json: { httpCode: e.httpCode, response: { ...e.validationResponse,\n    dead_letter_written: e.dead_letter_written,\n    dead_letter_error: e.dead_letter_error } } }];\n}\n\nreturn [{ json: { httpCode: e.httpCode, response: {\n  status: e.reason,\n  message: e.reason === 'permanent_failure'\n    ? 'The provider rejected this message permanently, so no further attempts were made. The record is in the dead letter.'\n    : 'All ' + e.attempts + ' attempts failed. The record is in the dead letter and has not been lost.',\n  correlation_id: e.correlation_id,\n  contractor_id: e.contractor_id,\n  attempts: e.attempts,\n  last_error: e.lastError,\n  dead_letter_written: e.dead_letter_written,\n  dead_letter_error: e.dead_letter_error,\n  alert\n} } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "7fdca4bf-02f1-51a8-907c-9c5a6e32b552",
+      "name": "Build Failure Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2920,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": "={{ $json.httpCode }}"
+        }
+      },
+      "id": "bb2b904a-cb11-5300-94ea-2922fc3c4121",
+      "name": "Respond to Caller",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        3160,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## WF2 RESILIENT DELIVERY v1.0\n\n**Setup: one credential.**\n\n1. `Append Dead Letter (Google Sheets)` -> select your Google Service Account credential.\n2. In the same spreadsheet as Workflow 1, add a second tab named `Dead_Letter`\n   with these headers in row 1:\n\n`correlation_id | timestamp | contractor_id | reason | attempts | last_error | last_http_status | payload_json | alerted`\n\nThe sheet ID is already set as a literal on that node. Both stub endpoints are public\necho services, so nothing else needs configuring.\n\n**How to demonstrate each requirement**\n\nSuccess             -> post a valid payload. Expect 200 `delivered`, 1 attempt.\nRetry then recover  -> point `emailUrl` at a flaky endpoint.\nRetries exhausted   -> add `\"_demo_force_failure\": true` to the payload. The sender is\n                       switched to an unreachable port, so all 4 attempts fail fast.\n                       Watch the loop run in the execution log, then the dead-letter row\n                       appear, then the alert fire. Expect 502 `retries_exhausted`.\nPermanent failure   -> point `emailUrl` at a 4xx endpoint. ONE attempt, no retries,\n                       straight to dead letter.\nMalformed payload   -> see the note in SCOPE AND HONESTY.\n\n**Publish the workflow and use the production URL.**",
+        "height": 700,
+        "width": 900,
+        "color": 4
+      },
+      "id": "04827891-29fc-57e0-a66e-424c63297696",
+      "name": "START HERE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -440,
+        -360
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Design decisions\n\n**The retry is a loop on this canvas, not a node setting.** `Send Email` has n8n's own\n`retryOnFail` switched OFF deliberately. `Evaluate Attempt` classifies the response,\n`Retries Remaining?` decides, `Wait Before Retry` backs off, and the wire runs back into\nthe HTTP node. Every attempt is therefore visible in the execution log and every\ndecision is inspectable, which a hidden node-level retry never is.\n\n**Only retryable failures are retried.** Transport errors, 5xx and 429 retry.\nAny other 4xx is a permanent client error and goes straight to the dead letter, because\nretrying a rejected recipient four times only delays the alert by seven seconds.\n\n**Exponential backoff with jitter.** 1s, 2s, 4s, capped at 8s, plus up to 25% random\njitter. Without jitter, every execution stalled by a provider outage retries in lockstep\nthe moment it recovers and knocks it over again.\n\n**Dead letter is written BEFORE the alert.** If the alert channel is also down, the\nrecord still exists. Persistence first, notification second.\n\n**Alerting is an allowlist.** Only `retries_exhausted` and `permanent_failure` page\nanyone, because only those mean <COMPANY>'s pipeline failed. A malformed body, an invalid\npayload and a failed validation are all recorded in the dead letter and none of them\nwake anyone at 3am. Alert fatigue is how real alerts get ignored.\n\n**The `alerted` column records intent, not state.** It says whether this record\nwarranted a page, which is true at write time and stays true. Marking it \"sent\"\nafterwards would need a second update-by-key write against the same row; that is\ndeliberately out of scope here, and the alert's actual outcome is in the HTTP response\nand the execution log.\n\n**A validation failure is recorded but does not page anyone.** It is the caller's to fix\nand cannot be replayed. An exhausted delivery is <COMPANY>'s problem and does page. Both are\npersisted, because \"nothing is silently lost\" is not the same as \"wake someone up\".",
+        "height": 700,
+        "width": 1000,
+        "color": 5
+      },
+      "id": "53b31e79-aea2-52ed-a6ce-1eb3ba263207",
+      "name": "DESIGN DECISIONS",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        500,
+        -360
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Scope and honesty\n\n**Where malformed JSON is actually caught.** If a caller declares\n`Content-Type: application/json` and sends invalid JSON, n8n's HTTP layer rejects it\nbefore any node runs and returns its own structured JSON error. No node can catch that.\nNothing crashes and nothing is half-processed. If the body arrives as text, Raw Body\nhands it to `Validate and Normalise`, which catches the parse failure and returns this\nworkflow's own 400 `invalid_json`. Both are graceful; they are owned by different\ncomponents. To see the second path, send the malformed body as `text/plain`.\n\n**2xx means accepted by the provider, not delivered to the human.** The response says\n`delivered` in the sense the provider accepted it, and the attempt history is returned\nso the caller can see exactly what happened.\n\n**If the dead-letter write itself fails**, the response says so explicitly rather than\nreturning a clean error. An audit gap you cannot see is worse than one you can.\n\n**Reusability.** The block from `Build Failure Record` to `Send Alert` is the pattern\nWorkflow 4 reuses. In a longer engagement it would be extracted into a shared sub-workflow\ncalled via Execute Workflow, so onboarding, payment chasing and screening all fail the\nsame way. It is kept inline here so each submitted workflow imports and runs alone.",
+        "height": 700,
+        "width": 1000,
+        "color": 5
+      },
+      "id": "158e9fc7-02dd-5b48-bf73-302e6a44a9ac",
+      "name": "SCOPE AND HONESTY",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        -360
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook - Delivery Request": {
+      "main": [
+        [
+          {
+            "node": "Set Runtime Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Runtime Config": {
+      "main": [
+        [
+          {
+            "node": "Validate and Normalise",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate and Normalise": {
+      "main": [
+        [
+          {
+            "node": "Payload Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Payload Valid?": {
+      "main": [
+        [
+          {
+            "node": "Init Retry State",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Retry State": {
+      "main": [
+        [
+          {
+            "node": "Send Email (stub endpoint)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email (stub endpoint)": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Evaluate Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Attempt": {
+      "main": [
+        [
+          {
+            "node": "Send Succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Succeeded?": {
+      "main": [
+        [
+          {
+            "node": "Build Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retries Remaining?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Success Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Caller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retries Remaining?": {
+      "main": [
+        [
+          {
+            "node": "Wait Before Retry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Before Retry": {
+      "main": [
+        [
+          {
+            "node": "Send Email (stub endpoint)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Failure Record": {
+      "main": [
+        [
+          {
+            "node": "Build Dead Letter Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Dead Letter Row": {
+      "main": [
+        [
+          {
+            "node": "Append Dead Letter (Google Sheets)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append Dead Letter (Google Sheets)": {
+      "main": [
+        [
+          {
+            "node": "Capture Dead Letter Write",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Capture Dead Letter Write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture Dead Letter Write": {
+      "main": [
+        [
+          {
+            "node": "Alert Required?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Required?": {
+      "main": [
+        [
+          {
+            "node": "Send Alert (stub endpoint)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Alert (stub endpoint)": {
+      "main": [
+        [
+          {
+            "node": "Build Failure Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Failure Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Caller",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/London",
+    "executionTimeout": 300,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  }
+}

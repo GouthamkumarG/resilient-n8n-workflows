@@ -1,0 +1,393 @@
+{
+  "name": "04 Overdue Payments Report",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "4cfd86e7-2c9b-5d9c-8bbe-f81b883830f0",
+      "name": "Schedule - Weekdays 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        300
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "00baddff-d766-57a9-a864-d34a04cedf19",
+      "name": "Manual Trigger - Run Now",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// WF4 runtime configuration. NON-SECRET values only.\n// The database credential is selected on the Postgres node, never written here.\nconst config = {\n  thresholdDays: 7,                                  // the specification's overdue threshold\n  reportUrl:     'https://postman-echo.com/post',    // stub for SendGrid or a Slack webhook\n  recipient:     'payments-ops@example.com',\n  teamName:      'Payments Operations',\n  demoMode: true\n};\nreturn $input.all().map(i => ({ json: { ...i.json, config } }));",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "b12d831c-5518-5bfd-9b81-42b7adaf22cf",
+      "name": "Set Runtime Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT contractor_id, name, status, last_payment_date, agency\nFROM contractors\nWHERE status = 'pending'\n  AND last_payment_date < CURRENT_DATE - ($1::int * INTERVAL '1 day')\nORDER BY last_payment_date ASC;",
+        "options": {
+          "queryReplacement": "={{ [$json.config.thresholdDays] }}"
+        }
+      },
+      "id": "c5f86e6c-89f2-5be8-93dc-5f233236ddac",
+      "name": "Query Overdue Pending Payments",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        20,
+        400
+      ],
+      "onError": "continueErrorOutput",
+      "alwaysOutputData": true,
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turns query rows into one summary object.\n// The Postgres node has alwaysOutputData ON, so an empty result still emits one empty\n// item. Filtering on contractor_id is what makes the zero-row case a normal outcome\n// rather than a workflow that quietly stops.\nconst cfg = $('Set Runtime Config').first().json.config;\nconst rows = $input.all().map(i => i.json).filter(r => r && r.contractor_id);\n\nconst today = new Date();\nconst daysSince = (d) => {\n  const then = new Date(String(d).slice(0, 10) + 'T00:00:00Z');\n  const now  = new Date(today.toISOString().slice(0, 10) + 'T00:00:00Z');\n  return Math.round((now - then) / 86400000);\n};\n\nconst contractors = rows.map(r => ({\n  contractor_id: r.contractor_id,\n  name: r.name,\n  agency: r.agency,\n  last_payment_date: String(r.last_payment_date).slice(0, 10),\n  days_overdue: daysSince(r.last_payment_date)\n}));\n\n// Grouped by agency, because the person reading this at 08:00 chases one agency at a\n// time, not one contractor at a time.\nconst byAgency = {};\nfor (const c of contractors) (byAgency[c.agency] = byAgency[c.agency] || []).push(c);\nconst agencies = Object.keys(byAgency).sort((a, b) => byAgency[b].length - byAgency[a].length);\n\n// Rows arrive ORDER BY last_payment_date ASC, so the oldest is first. Recomputed here\n// anyway rather than trusting the ordering to survive a future query edit.\nconst oldest = contractors.reduce((a, c) => (!a || c.days_overdue > a.days_overdue ? c : a), null);\n\nreturn [{ json: { config: cfg,\n  run_at: today.toISOString(),\n  summary: {\n    total_count: contractors.length,\n    threshold_days: cfg.thresholdDays,\n    contractors,\n    agencies: agencies.map(a => ({ agency: a, count: byAgency[a].length, contractors: byAgency[a] })),\n    oldest\n  },\n  has_results: contractors.length > 0 } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "c5560644-e916-55b2-8476-bc6223165898",
+      "name": "Summarise Query Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d688c9ae-5367-55cd-84bc-c00971f96109",
+              "leftValue": "={{ $json.has_results === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fbf4920e-5842-5741-9748-7a76668f61ba",
+      "name": "Any Overdue Contractors?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Human readable. A person reads this at 08:00 with a coffee, not a JSON parser.\nconst e = $input.first().json, s = e.summary, cfg = e.config;\nconst tag = cfg.demoMode ? '[DEMO] ' : '';\n\nconst when = new Date(e.run_at).toLocaleDateString('en-GB',\n  { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/London' });\n\nconst L = [];\nL.push('Overdue pending payments');\nL.push(when);\nL.push('');\nL.push(s.total_count + ' contractor' + (s.total_count === 1 ? ' has' : 's have') +\n       ' been pending for more than ' + s.threshold_days + ' days.');\nL.push('');\nL.push('Oldest: ' + s.oldest.name + ' (' + s.oldest.agency + '), last paid ' +\n       s.oldest.last_payment_date + ', ' + s.oldest.days_overdue + ' days ago.');\nL.push('');\nL.push('By agency:');\nfor (const a of s.agencies) {\n  L.push('');\n  L.push('  ' + a.agency + '  (' + a.count + ')');\n  for (const c of a.contractors) {\n    L.push('    ' + c.name.padEnd(20) + ' ' + c.contractor_id +\n           '   last paid ' + c.last_payment_date + '   ' + c.days_overdue + ' days');\n  }\n}\nL.push('');\nL.push('Chase the oldest first. Anything past 30 days should be escalated.');\n\nreturn [{ json: { ...e, outcome: 'report_sent', reportBody: {\n  to: cfg.recipient,\n  subject: tag + 'Overdue pending payments: ' + s.total_count + ' contractor' +\n           (s.total_count === 1 ? '' : 's') + ' need chasing',\n  text: L.join('\\n')\n} } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "067dca52-9fdd-53b5-98b6-77adf38668aa",
+      "name": "Build Overdue Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Zero results is a normal, successful outcome, not an error and not silence.\n// A daily report that simply does not arrive is indistinguishable from a broken workflow,\n// which is exactly how an unpaid contractor goes unnoticed for a week.\nconst e = $input.first().json, cfg = e.config;\nconst tag = cfg.demoMode ? '[DEMO] ' : '';\nconst when = new Date(e.run_at).toLocaleDateString('en-GB',\n  { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/London' });\n\nconst text = [\n  'Overdue pending payments',\n  when,\n  '',\n  'Nothing to action today.',\n  '',\n  'No contractor has been pending for more than ' + cfg.thresholdDays + ' days.',\n  'The query ran successfully and returned zero rows.'\n].join('\\n');\n\nreturn [{ json: { ...e, outcome: 'nothing_to_action', reportBody: {\n  to: cfg.recipient,\n  subject: tag + 'Overdue pending payments: nothing to action today',\n  text\n} } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "59101d45-5162-5a2e-9f07-263297dce5ab",
+      "name": "Build Nothing To Action Notice",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// If the query itself fails, say so loudly. A report that silently does not arrive looks\n// exactly like a day with no overdue payments, and that is the failure this whole\n// workflow exists to prevent.\nconst cfg = $('Set Runtime Config').first().json.config;\nconst r = $input.first().json;\nconst detail = String((r.error && (r.error.message || r.error.description)) || r.error ||\n                      'unknown database error').slice(0, 400);\nconst now = new Date().toISOString();\n\nreturn [{ json: { config: cfg, run_at: now, outcome: 'query_failed',\n  summary: { total_count: null, threshold_days: cfg.thresholdDays },\n  reportBody: {\n    to: cfg.recipient,\n    subject: (cfg.demoMode ? '[DEMO] ' : '') +\n             '[ACTION REQUIRED] Overdue payments report did not run',\n    text: [\n      'Overdue pending payments',\n      new Date(now).toLocaleDateString('en-GB',\n        { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/London' }),\n      '',\n      'THE REPORT DID NOT RUN. Treat today as unchecked, not as clear.',\n      '',\n      'Database error: ' + detail,\n      '',\n      'Someone must confirm manually whether any contractor is overdue.'\n    ].join('\\n')\n  } } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "28afe911-77db-5fb8-9d9d-2ebf3312e543",
+      "name": "Build Query Failure Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.reportUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.reportBody) }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "3661c335-6c18-52c2-a36c-e3b0dd51a046",
+      "name": "Send Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1000,
+        400
+      ],
+      "onError": "continueErrorOutput",
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\n\n// Recover the outcome from whichever of the three branches produced it.\nlet ctx = null;\nfor (const n of ['Build Overdue Report', 'Build Nothing To Action Notice', 'Build Query Failure Alert']) {\n  try { const j = $(n).first().json; if (j && j.outcome) { ctx = j; break; } } catch (err) { /* not this branch */ }\n}\nif (!ctx) ctx = { outcome: 'unknown', summary: {}, run_at: new Date().toISOString() };\n\nconst status = Number(r.statusCode || 0);\nconst transport = Boolean(r.error) || !status;\nconst sent = !transport && status >= 200 && status < 300;\n\nreturn [{ json: {\n  run_at: ctx.run_at,\n  outcome: ctx.outcome,\n  overdue_count: ctx.summary ? ctx.summary.total_count : null,\n  oldest: ctx.summary && ctx.summary.oldest ? ctx.summary.oldest : null,\n  report_sent: sent,\n  send_error: sent ? null : (transport\n    ? String((r.error && (r.error.message || r.error.description)) || r.error || 'transport failure').slice(0, 200)\n    : 'HTTP ' + status),\n  recipient: ctx.reportBody ? ctx.reportBody.to : null,\n  subject: ctx.reportBody ? ctx.reportBody.subject : null\n} }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "ae439133-77c7-5314-bde5-7d696a8f2c5f",
+      "name": "Capture Send Outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## WF4 OVERDUE PAYMENTS REPORT v1.0\n\n**Setup**\n\n1. Create a Postgres database. A free one at neon.tech takes about two minutes and\n   needs no server administration.\n2. Run `WF4-seed.sql` against it (Neon has a SQL editor in the browser).\n3. n8n -> Credentials -> New -> Postgres. Host, database, user, password, port 5432,\n   SSL = require. Select it on `Query Overdue Pending Payments`.\n4. Run it with the **Manual Trigger** for the demo. The schedule fires weekdays at 08:00,\n   which is not a useful thing to wait for on camera.\n\n**Expected on the seed data:** 6 contractors, oldest Marek Kowalski at 29 days.\n`C-40007` sits exactly on the 7 day boundary and must NOT appear, which is the boundary\ntest. Change his `last_payment_date` to `CURRENT_DATE - 8` and he should appear.\n\n**To demonstrate the empty case:**\n`UPDATE contractors SET status = 'active' WHERE status = 'pending';`\nRun again: you get a \"nothing to action today\" message, and the run still completes\ngreen. Then set them back.\n\n**To demonstrate the failure case:** break the Postgres credential password and run.\nYou get an ACTION REQUIRED alert, not silence.",
+        "height": 700,
+        "width": 900,
+        "color": 4
+      },
+      "id": "fcbcc182-ae5e-54c8-a801-f43b742bc39b",
+      "name": "START HERE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        -400
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Design decisions\n\n**Two triggers.** The Schedule Trigger is the real one, weekday cron at 08:00 in the\nworkflow's Europe/London timezone so it does not drift by an hour in and out of BST.\nThe Manual Trigger exists so the workflow can be demonstrated and tested on demand\nwithout editing the schedule.\n\n**The query is parameterised.** The threshold is passed as `$1` and cast, never\nconcatenated into the SQL string. There is no user input on this path today, but a\nreport that grows a filter later should not have to be rewritten securely under time\npressure.\n\n**alwaysOutputData is ON for the query.** Without it an empty result set produces no\nitems and the branch simply stops, which reads as success and sends nothing. With it,\nzero rows becomes an explicit, testable state.\n\n**Zero results still sends a message.** \"Nothing to action today\" and no email at all\nlook identical to a broken workflow, and this workflow exists precisely so that nobody\nhas to notice an absence.\n\n**A failed query alerts louder than a full report.** If the database is unreachable the\nteam is told the report DID NOT RUN and today is unchecked. The dangerous outcome is not\na bad report; it is a missing one that gets read as \"all clear\".\n\n**Grouped by agency, sorted by count.** Whoever reads this chases one agency at a time,\nso the report is shaped for the phone call they are about to make, not for the table it\ncame from.",
+        "height": 700,
+        "width": 950,
+        "color": 5
+      },
+      "id": "dee2e5c0-ec86-57d5-aa8f-6bf5642d3669",
+      "name": "DESIGN DECISIONS",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        500,
+        -400
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Credentials: development versus production\n\n**In this build.** No connection string, host, user or password appears anywhere in the\nworkflow JSON. The Postgres credential is selected on the node and stored encrypted by\nn8n, using the instance's `N8N_ENCRYPTION_KEY`. The exported JSON can therefore be shared\nor committed without leaking anything. Everything non-secret and environment-specific\nlives in one `Set Runtime Config` node, so the workflow is portable without editing nodes\nscattered across the canvas.\n\n**What changes in production at <COMPANY>.**\nSeparate credentials per environment, never one shared across dev and live, so a mistake\nin development cannot touch payroll data. A dedicated database login for n8n with SELECT\nonly on the specific tables it reads, rather than a general application account: this\nworkflow never needs to write, so it should not be able to. Secrets held in an external\nstore, Azure Key Vault given the rest of the stack, referenced by n8n rather than typed\ninto it, so rotation happens in one place and no human ever handles the value. Rotation\non a schedule and on any staff change. `N8N_ENCRYPTION_KEY` itself backed up and\naccess-controlled, because credentials are unrecoverable without it. Access to the n8n\ncredential list restricted, since anyone who can edit a workflow can use a credential\neven without seeing it. And an audit trail of who ran what, which matters more for\npayroll and screening data than for most systems.\n\n**Connecting to Microsoft SQL Server** instead of Postgres changes the node and the date\nfunction, not the shape of any of this.",
+        "height": 700,
+        "width": 1050,
+        "color": 6
+      },
+      "id": "36a8f6b9-4cb6-52cf-b144-1e56be061651",
+      "name": "CREDENTIALS",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        -400
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule - Weekdays 08:00": {
+      "main": [
+        [
+          {
+            "node": "Set Runtime Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger - Run Now": {
+      "main": [
+        [
+          {
+            "node": "Set Runtime Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Runtime Config": {
+      "main": [
+        [
+          {
+            "node": "Query Overdue Pending Payments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Overdue Pending Payments": {
+      "main": [
+        [
+          {
+            "node": "Summarise Query Results",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Query Failure Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarise Query Results": {
+      "main": [
+        [
+          {
+            "node": "Any Overdue Contractors?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Overdue Contractors?": {
+      "main": [
+        [
+          {
+            "node": "Build Overdue Report",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Nothing To Action Notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Overdue Report": {
+      "main": [
+        [
+          {
+            "node": "Send Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Nothing To Action Notice": {
+      "main": [
+        [
+          {
+            "node": "Send Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Query Failure Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Report": {
+      "main": [
+        [
+          {
+            "node": "Capture Send Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Capture Send Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/London",
+    "executionTimeout": 300,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  }
+}

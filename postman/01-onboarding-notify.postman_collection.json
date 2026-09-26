@@ -1,0 +1,161 @@
+{
+  "info": {
+    "name": "01 Onboarding Notify",
+    "description": "Test payloads for the Workflow 1 onboarding notification workflow.\n\nRun order for a demo:\n1, 1 again (duplicate), 2, 3, 4.\n\nBefore running: the workflow must be ACTIVE in n8n and baseUrl must point at the /webhook/ production path, not /webhook-test/.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1 - Welcome (documents verified)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"contractor_id\": \"C-10021\",\n  \"name\": \"Aisha Khan\",\n  \"email\": \"aisha.khan@example.com\",\n  \"phone\": \"+447700900123\",\n  \"contract_type\": \"Umbrella\",\n  \"start_date\": \"2026-09-22\",\n  \"agency_name\": \"Northgate Recruitment\",\n  \"documents_verified\": true\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}",
+          "host": [
+            "{{baseUrl}}"
+          ]
+        },
+        "description": "Expect 200 and status welcome_sent.\n\nSEND THIS TWICE. The second send must return 200 duplicate_suppressed with no new email. That only works if the workflow is ACTIVE and you are using the /webhook/ URL, because n8n does not persist workflow static data on test executions."
+      },
+      "response": []
+    },
+    {
+      "name": "2 - Documents outstanding (chase branch)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"contractor_id\": \"C-10022\",\n  \"name\": \"Tomasz Nowak\",\n  \"email\": \"t.nowak@example.com\",\n  \"phone\": \"+447700900456\",\n  \"contract_type\": \"PAYE\",\n  \"start_date\": \"2026-09-29\",\n  \"agency_name\": \"Brightline Staffing\",\n  \"documents_verified\": false\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}",
+          "host": [
+            "{{baseUrl}}"
+          ]
+        },
+        "description": "documents_verified is false, so this routes to the chase branch. Expect 200 and status documents_outstanding_sent, and a different email subject: 'Action needed, documents outstanding'."
+      },
+      "response": []
+    },
+    {
+      "name": "3 - Validation failure (4 problems at once)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"contractor_id\": \"C-10023\",\n  \"name\": \"Sam Patel\",\n  \"email\": \"not-an-email\",\n  \"phone\": \"+447700900789\",\n  \"start_date\": \"22/09/2026\",\n  \"agency_name\": \"Harborview Talent\",\n  \"documents_verified\": \"false\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}",
+          "host": [
+            "{{baseUrl}}"
+          ]
+        },
+        "description": "Four deliberate faults: contract_type missing, email invalid, start_date in UK format instead of ISO, and documents_verified sent as the STRING \"false\" rather than a boolean.\n\nExpect 422 with all four returned in one errors array. The string-boolean case matters: \"false\" is truthy in JavaScript, so accepting it would route an unverified contractor down the welcome branch."
+      },
+      "response": []
+    },
+    {
+      "name": "4 - Malformed JSON body",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"contractor_id\":",
+          "options": {
+            "raw": {
+              "language": "text"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}",
+          "host": [
+            "{{baseUrl}}"
+          ]
+        },
+        "description": "Truncated JSON. Body mode is deliberately set to TEXT so Postman does not reformat it, while the Content-Type header still claims application/json.\n\nExpect 400 with status invalid_json, and critically: the workflow does NOT crash. Check the n8n execution list afterwards, the run completes cleanly."
+      },
+      "response": []
+    },
+    {
+      "name": "5 - Welcome, Ltd contract",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"contractor_id\": \"C-10024\",\n  \"name\": \"Grace O'Donnell\",\n  \"email\": \"grace.odonnell@example.com\",\n  \"phone\": \"+447700900222\",\n  \"contract_type\": \"Ltd\",\n  \"start_date\": \"2026-10-06\",\n  \"agency_name\": \"Kestrel Contract Services\",\n  \"documents_verified\": true\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}",
+          "host": [
+            "{{baseUrl}}"
+          ]
+        },
+        "description": "Spare clean run, useful for a second audit row and to show the Ltd contract type."
+      },
+      "response": []
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:5678/webhook/onboarding",
+      "type": "string"
+    }
+  ]
+}
