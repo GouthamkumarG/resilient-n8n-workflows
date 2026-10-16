@@ -1,12 +1,14 @@
 # Resilient n8n Workflows
 
-Four production-pattern n8n workflows for contractor onboarding, message delivery, AI document extraction and scheduled reporting.
+Four n8n workflows covering the jobs automation actually gets asked to do: **scheduled reporting**, **multi-channel notifications**, **LLM document extraction**, and **message delivery that has to survive a flaky provider**.
 
-Built as a practical exercise in one question: **what should an automation do when something goes wrong?**
+Built around one question: **what should an automation do when something goes wrong?**
 
 Anything can fail. A provider goes down, a document is malformed, a database is unreachable, a model invents a value. None of that is interesting on its own. What matters is whether the failure is visible, whether the record survives it, and whether the caller is told the truth about what happened.
 
 Every workflow here is built around that. There are no swallowed errors, no blind retries, and no success responses for work that did not succeed.
+
+If you build internal tools and automations, the useful part is not the workflows themselves. It is the failure handling, and the reasoning behind every choice is written on the canvas next to the node it belongs to.
 
 All names and data are fictional. `<COMPANY>` is a placeholder you can replace with anything, and the email addresses use `example.com`, a domain reserved for documentation.
 
@@ -32,6 +34,8 @@ Every send endpoint points at `postman-echo.com`, a public endpoint that accepts
 
 ### 01 Onboarding Notify
 
+*Pattern: event-driven notification that must never fire twice, across two channels, with an honest status back to the caller.*
+
 A contractor is signed up. Tell them, once, by two channels, and record it.
 
 Picks one of two messages depending on whether their documents are verified, sends by email and SMS independently, and writes one audit row per event.
@@ -40,6 +44,8 @@ Picks one of two messages depending on whether their documents are verified, sen
 - **Three delivery states, not two.** Accepted, rejected, and *uncertain*. A timeout is not a failure, it is an absence of information. Both accepted returns 200. One accepted returns 207 and says `degraded` rather than pretending it was clean. Uncertain returns 502 and **keeps** the claim so a retry cannot double send. Only a send known to have failed releases the claim.
 
 ### 02 Resilient Delivery
+
+*Pattern: retry, backoff and dead-lettering for any outbound call to a service you do not control.*
 
 Send something. If it fails, retry properly. If it keeps failing, lose nothing and tell a human.
 
@@ -51,6 +57,8 @@ Send something. If it fails, retry properly. If it keeps failing, lose nothing a
 
 ### 03 Timesheet Extraction
 
+*Pattern: LLM extraction from unstructured text, with the model's output verified against the source before anything is trusted.*
+
 Pull structured fields out of a free-text timesheet using the Anthropic Messages API, then verify the model did not invent them.
 
 - **Forced tool use, not "reply with JSON".** `tool_choice` pins the model to one tool with a declared input schema, so the reply comes back as structured arguments rather than prose that has to be parsed out of a paragraph.
@@ -60,6 +68,8 @@ Pull structured fields out of a free-text timesheet using the Anthropic Messages
 - Prompt injection is handled by wrapping the document in delimiters and treating its contents as data. Every approval rule sits outside the model.
 
 ### 04 Overdue Payments Report
+
+*Pattern: scheduled report that lands in someone's inbox, and that is impossible to confuse with a job that silently stopped running.*
 
 Every weekday at 08:00, find contractors whose payment has been pending more than seven days and email the list, grouped by agency.
 
